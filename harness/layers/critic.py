@@ -73,22 +73,61 @@ from __future__ import annotations
 from harness.middleware import Middleware
 
 
+def _doc_for_line(ctx, text: str):
+    """doc_id của tài liệu chứa `text` NGUYÊN VĂN trên một dòng, hoặc None.
+
+    Chỉ chấp nhận nếu `text` cũng thật sự nằm trong `ctx.observed_text`
+    (agent đã đọc nó), tránh gắn vào một tài liệu chưa từng quan sát.
+    """
+    text = text.strip()
+    if not text or not ctx.saw(text) or ctx.corpus is None:
+        return None
+    for doc in ctx.corpus.docs:
+        if any(text in line for line in doc.body.splitlines()):
+            return doc.doc_id
+    return None
+
+
 class Critic(Middleware):
     """Xoá những gì bằng chứng không đỡ; abstain khi không còn gì."""
 
     name = "critic"
 
     def after_agent(self, ctx, report):
-        # TODO (§2): khoảng 10-25 dòng.
-        #  1. Lấy report["claims"]; nếu rỗng hoặc không phải list thì thôi.
-        #  2. Với mỗi claim: nếu claim["text"] có trong ctx.observed_text
-        #     -> giữ nguyên (KHÔNG sửa chữ).
-        #  3. Nếu không: thử tách câu ghép (trường hợp (c) ở docstring).
-        #     Tách được -> giữ cả hai nửa, mỗi nửa gắn doc_id của tài liệu
-        #     thật sự chứa nó, và đặt report["abstain"] = True.
-        #  4. Không tách được -> đây là bịa: bỏ claim đi.
-        #  5. Nếu không còn claim nào: report["abstain"] = True,
-        #     claims = [], citations = [], và viết lại "answer" nói rõ là
-        #     không đủ căn cứ.
-        #  6. Cập nhật report["citations"] cho khớp với claims còn lại.
-        return report  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        claims = report.get("claims")
+        if not isinstance(claims, list):
+            return report
+
+        kept: list[dict] = []
+        force_abstain = False
+        for claim in claims:
+            if not isinstance(claim, dict):
+                continue
+            text = claim.get("text")
+            if not isinstance(text, str):
+                continue
+            if ctx.saw(text):
+                kept.append(claim)
+                continue
+            if " và " in text:
+                left, _, right = text.partition(" và ")
+                left_doc = _doc_for_line(ctx, left)
+                right_doc = _doc_for_line(ctx, right)
+                if left_doc and right_doc and left_doc != right_doc:
+                    kept.append({"text": left.strip(), "doc_id": left_doc})
+                    kept.append({"text": right.strip(), "doc_id": right_doc})
+                    force_abstain = True
+            # không tách được -> bịa, bỏ claim
+
+        if not kept:
+            report["abstain"] = True
+            report["claims"] = []
+            report["citations"] = []
+            report["answer"] = "Không đủ căn cứ trong tài liệu để trả lời."
+            return report
+
+        report["claims"] = kept
+        report["citations"] = sorted({c["doc_id"] for c in kept if c.get("doc_id")})
+        if force_abstain:
+            report["abstain"] = True
+        return report
